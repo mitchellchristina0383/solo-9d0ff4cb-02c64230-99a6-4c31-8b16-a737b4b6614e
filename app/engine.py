@@ -2,10 +2,12 @@
 
 核心性质：
 - 分叉只增加引用计数，不分配新块 —— 池满也能分叉；
-- 追加前先算清所需块数（含写时复制），空闲不足则整体拒绝，
-  分支内容与块占用保持不变（原子性由全局锁保证）；
-- 分叉点落在块内时，子分支引用该块但只承认前 position 个槽位，
-  追加时对该共享块写时复制，父分支内容不受影响；
+- 追加按「实际写入位置的可见范围」算清所需块数（含写时复制），空闲不足则
+  整次拒绝，分支内容与块占用保持不变（原子性由全局锁保证）；
+- 分叉点落在块内时，子分支引用该块但只承认前 position 个槽位；共享尾块的
+  空闲槽位若在其他分支可见前缀之外，可直接原地续写（无需新块）；
+- 若写入位置已被其他分支可见，则写时复制出一块私有块隔离写入，被覆盖风险
+  的对方词元与缓存原样保住；
 - 关闭分支只回收引用计数归零的块。
 """
 from __future__ import annotations
@@ -103,6 +105,26 @@ class Engine:
         b = branch.block_ids[pos // self.pool.block_size]
         self.pool.write(b, pos % self.pool.block_size, k, v)
 
+    def _max_other_visible_slots(self, branch: Branch, block_id: int) -> int:
+        """其他分支在 block_id 中可见的最大槽位数（0 表示无人可见）。
+
+        分叉只共享同下标的前缀块，因此同一物理块在各引用分支里的逻辑下标一致；
+        某分支在该块可见的槽位数 = min(block_size, 分支长度 - 块起始位置)。
+        """
+        B = self.pool.block_size
+        best = 0
+        for session in self.sessions.values():
+            for other in session.branches.values():
+                if other.id == branch.id:
+                    continue
+                for i, b in enumerate(other.block_ids):
+                    if b == block_id:
+                        used = min(B, other.length - i * B)
+                        if used > best:
+                            best = used
+                        break
+        return best
+
     def _gather_kv(self, branch: Branch) -> tuple[np.ndarray, np.ndarray]:
         """从块中按逻辑顺序收集该分支全部缓存的 K/V —— 预测只依赖缓存，不重算历史。"""
         n = branch.length
@@ -195,6 +217,37 @@ class Engine:
 
     # ---------- 追加（原子，受总块数限制） ----------
 
+    def _append_cost_locked(self, branch: Branch, new_len: int) -> tuple[int, bool]:
+        """计算把分支追加到 new_len 所需的新增空闲块数，以及是否需隔离尾块。
+
+        未满尾块的槽位 [L % B, B) 不一定都能原地续写：若其他分支（同一池内，
+        可能来自别的会话）的可见前缀覆盖了其中任意槽位，原地写就会覆盖它们的
+        词元与 KV 缓存，此时必须写时复制出一块私有块再写。
+
+        某分支在物理块中的可见槽位数 = min(B, 分支长度 - 块起始位置)；
+        因此只要「其他分支的最大可见槽位数 > 本分支已用槽位数 L % B」，
+        本分支接下来的第一个写入位置（槽 L % B）就已被他方可见，需隔离。
+
+        返回 (extra, isolate)：
+        - extra = 新增整块数 + 隔离尾块所需的 1 块（原尾块仍被共享方引用，
+          不能回收；本分支换到新块，故净增 1 块）；
+        - 尾块空闲槽位都落在他方可见前缀之外时 isolate=False，原地续写、零新增块。
+        """
+        B = self.pool.block_size
+        L = branch.length
+        cur_blocks = len(branch.block_ids)
+        need_blocks = _ceil_div(new_len, B)
+
+        isolate = False
+        if L % B != 0 and cur_blocks > 0:
+            tail = branch.block_ids[-1]
+            if self.pool.refcount[tail] > 1:
+                # 只有他方可见到槽 L % B 及之后时，写入才会破坏他方缓存
+                isolate = self._max_other_visible_slots(branch, tail) > L % B
+
+        extra = (need_blocks - cur_blocks) + (1 if isolate else 0)
+        return extra, isolate
+
     def append(self, session_id: str, branch_id: str, tokens: list[int]) -> dict:
         self._check_tokens(tokens)
         with self.lock:
@@ -208,18 +261,19 @@ class Engine:
 
             cur_blocks = len(branch.block_ids)
             need_blocks = _ceil_div(new_len, B)
-            # 末尾块未满且被共享 -> 追加前必须写时复制一块
-            cow = (L % B != 0 and cur_blocks > 0
-                   and self.pool.refcount[branch.block_ids[-1]] > 1)
-            extra = (need_blocks - cur_blocks) + (1 if cow else 0)
+            # 按「实际写入位置的可见范围」算清本次追加所需块数：
+            # 尾块空闲槽位若已被其他分支可见，需隔离写入（写时复制 1 块）；
+            # 若都落在它们可见前缀之外，则可原地续写，无需新块。
+            extra, isolate = self._append_cost_locked(branch, new_len)
             if self.pool.num_free < extra:
                 # 整体拒绝：分支内容与块占用保持原样
                 raise CapacityError(
                     f"追加 {len(tokens)} 个词元需要 {extra} 个空闲块，"
                     f"当前仅 {self.pool.num_free} 个，本次追加已整体拒绝")
 
-            # 提交阶段：先写时复制，再补齐新块，最后写入 K/V
-            if cow:
+            # 提交阶段：先隔离尾块，再补齐新块，最后写入 K/V
+            if isolate:
+                # 原尾块仍被他方引用（词元与缓存都要保住），只复制本分支可见前缀
                 old = branch.block_ids[-1]
                 nb = self.pool.alloc()
                 self.pool.copy_prefix(old, nb, L % B)

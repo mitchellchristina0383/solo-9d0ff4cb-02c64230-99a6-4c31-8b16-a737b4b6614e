@@ -102,6 +102,54 @@ def test_validation_errors(server):
     assert stats()["used_blocks"] == 0
 
 
+def test_full_pool_continues_longer_branch_over_http(server):
+    """网页复测场景：池满 + 块内分叉，较长分支在共享尾块可见前缀之外续写成功。"""
+    eng = server
+    assert stats()["free_blocks"] == 32
+
+    # 会话 A：10 词元 -> 3 块（尾块占 2 槽）；会话 B 填满剩余 29 块
+    tokens = [i % 64 for i in range(10)]
+    r = requests.post(BASE + "/api/sessions", json={"tokens": tokens})
+    assert r.status_code == 201, r.text
+    sid, main = r.json()["session_id"], r.json()["branch"]["id"]
+    r = requests.post(BASE + "/api/sessions",
+                      json={"tokens": [i % 64 for i in range(116)] })
+    assert r.status_code == 201, r.text
+    sid_b = r.json()["session_id"]
+    assert stats()["free_blocks"] == 0             # 池已满
+
+    # 分叉点 9：子分支只可见尾块槽0；父分支（10 词元）已用槽0、1，还可写槽2、3
+    r = requests.post(BASE + f"/api/sessions/{sid}/fork",
+                      json={"branch_id": main, "position": 9})
+    assert r.status_code == 201, r.text
+    child = r.json()["branch"]["id"]
+
+    # 池满，但父分支写入槽2、3（子分支可见前缀之外）-> 应成功，网页不再报块不够
+    r = requests.post(BASE + f"/api/sessions/{sid}/append",
+                      json={"branch_id": main, "tokens": [7, 8]})
+    assert r.status_code == 200, r.text
+    assert r.json()["branch"]["length"] == 12
+    assert stats()["free_blocks"] == 0
+
+    # 子分支接下来要写槽1（已被父分支可见），池满无法隔离 -> 409 整体拒绝
+    r = requests.post(BASE + f"/api/sessions/{sid}/append",
+                      json={"branch_id": child, "tokens": [9]})
+    assert r.status_code == 409, r.text
+
+    # 两条分支的预测都与各自词元从头计算一致；被拒子分支内容不变
+    detail = requests.get(BASE + f"/api/sessions/{sid}").json()
+    by_id = {b["id"]: b for b in detail["branches"]}
+    assert by_id[main]["tokens"] == tokens + [7, 8]
+    assert by_id[child]["tokens"] == tokens[:9]
+    for b in detail["branches"]:
+        want = int(np.argmax(eng.model.scratch_logits(b["tokens"])))
+        assert b["prediction"]["argmax"] == want
+
+    requests.delete(BASE + f"/api/sessions/{sid}")
+    requests.delete(BASE + f"/api/sessions/{sid_b}")
+    assert stats()["free_blocks"] == 32
+
+
 def test_concurrent_appends_over_http_respect_capacity(server):
     eng = server
     assert stats()["free_blocks"] == 32  # 前序测试已清理干净
